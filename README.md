@@ -25,6 +25,6 @@ LIPAS (Lightweight Penetration Assessment Suite) is a comprehensive, modular, an
 ### From Source
 
 ```bash
-git clone https://github.com/A1b2e3l4/lipas.git
+git clone https://github.com/abelmuturi-dev/LIPAS.git
 cd lipas
 pip install -r requirements.txt
