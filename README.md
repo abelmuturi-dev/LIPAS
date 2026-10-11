@@ -63,6 +63,12 @@
 
 ## 🆕 What's New in `1.1.0`
 
+<p>
+<a href="https://github.com/abelmuturi-dev/LIPAS/commits/v1.0.0"><img src="https://img.shields.io/badge/v1.0.0-commit_history-2C5364?style=flat-square&logo=github&logoColor=white" /></a>
+&nbsp;
+<a href="https://github.com/abelmuturi-dev/LIPAS/compare/v1.0.0...v1.1.0"><img src="https://img.shields.io/badge/v1.0.0...v1.1.0-full_diff-0f2027?style=flat-square&logo=git&logoColor=white" /></a>
+</p>
+
 <details open>
 <summary><b>Click to expand the full changelog</b></summary>
 <br/>
