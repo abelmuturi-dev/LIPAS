@@ -20,6 +20,7 @@ scanning may be illegal.
 """
 
 import argparse
+import builtins
 import ipaddress
 import json
 import os
@@ -31,6 +32,7 @@ import ssl
 import sys
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlparse, urljoin, urlunparse
@@ -41,7 +43,6 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup, Comment
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 try:
     import tldextract
@@ -51,9 +52,40 @@ except ImportError:  # optional: falls back to simple suffix handling
 VERSION = "1.1.0"
 log = logging.getLogger("lipas")
 
+GREEN = "\033[32m"
+BLUE = "\033[34m"
+RED = "\033[31m"
+RESET = "\033[0m"
+
+
+def console_print(*values, sep=" ", end="\n", file=None, flush=False,
+                  color=GREEN):
+    """Print green text on terminals while keeping redirected output clean."""
+    stream = file or sys.stdout
+    message = sep.join(str(value) for value in values) + end
+    if stream.isatty() and "NO_COLOR" not in os.environ:
+        message = f"{color}{message}{RESET}"
+    builtins.print(message, end="", file=stream, flush=flush)
+
+
+class GreenFormatter(logging.Formatter):
+    """Color log output green when writing to an interactive terminal."""
+
+    def format(self, record):
+        message = super().format(record)
+        if sys.stderr.isatty() and "NO_COLOR" not in os.environ:
+            return f"{GREEN}{message}{RESET}"
+        return message
+
 # Bundled public-suffix snapshot is used (no first-run network fetch).
 _tld_extract = (
-    tldextract.TLDExtract(suffix_list_urls=()) if tldextract else None
+    # Keep the bundled suffix-list cache in a writable temporary location.
+    # The default cache lives under the user's home directory, which may be
+    # read-only in containers and managed execution environments.
+    tldextract.TLDExtract(
+        suffix_list_urls=(),
+        cache_dir=os.path.join(tempfile.gettempdir(), "lipas-tldextract-cache"),
+    ) if tldextract else None
 )
 
 COMMON_SECOND_LEVEL = {
@@ -113,6 +145,18 @@ REMEDIATION = {
         "Remove the file from the web root or block access; rotate any exposed secrets.",
     "Information Disclosure":
         "Strip sensitive data from comments, error messages and public metadata.",
+    "Weak Content Security Policy":
+        "Remove unsafe-inline, unsafe-eval and broad source wildcards; define restrictive script-src and default-src directives.",
+    "Weak HSTS Configuration":
+        "Use a max-age of at least one year and consider includeSubDomains after verifying all subdomains support HTTPS.",
+    "Mixed Content":
+        "Load all scripts, styles, frames, media and other page resources over HTTPS.",
+    "Insecure Form":
+        "Submit credentials only over HTTPS and use POST rather than GET for password forms.",
+    "Unsafe External Link":
+        "Add rel=\"noopener noreferrer\" to external links that open in a new tab.",
+    "TLS Certificate":
+        "Install a valid certificate for the hostname and renew it before expiration.",
 }
 
 
@@ -206,13 +250,10 @@ class ScannerCore:
         session = requests.Session()
         session.verify = self.config.verify_tls
         session.max_redirects = self.config.max_redirects
-        retry = Retry(
-            total=self.config.retry_attempts,
-            backoff_factor=0.3,
-            status_forcelist=(429, 500, 502, 503, 504),
-        )
         adapter = HTTPAdapter(
-            max_retries=retry,
+            # Each scan request is an independent probe. Automatic retries
+            # multiply delays and emit noisy warnings for unreachable hosts.
+            max_retries=0,
             pool_connections=self.config.max_threads,
             pool_maxsize=self.config.max_threads,
         )
@@ -236,7 +277,26 @@ class ScannerCore:
                 if wait > 0:
                     time.sleep(wait)
         kwargs.setdefault("timeout", self.config.request_timeout)
-        resp = self.session.request(method, url, **kwargs)
+        try:
+            resp = self.session.request(method, url, **kwargs)
+        except requests.exceptions.SSLError as exc:
+            # v1.0.0 scanned sites with unverified TLS. Preserve v1.1's
+            # verified default, but retry certificate-only failures so an
+            # expired or self-signed certificate does not prevent the HTTP
+            # checks from running. The TLS finding is still reported by the
+            # certificate scanner, and this fallback is made visible.
+            if not self.config.verify_tls or "verify" in kwargs:
+                raise
+            log.debug(
+                "TLS certificate validation failed for %s; retrying this request "
+                "without certificate verification: %s",
+                url, exc,
+            )
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["verify"] = False
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                resp = self.session.request(method, url, **retry_kwargs)
         with self._lock:
             self._last_request = time.monotonic()
         return resp
@@ -287,6 +347,11 @@ class DomainScanner(ScannerCore):
                     info[key] = sorted({str(r).rstrip(".") for r in answers})
             except dns.exception.DNSException as exc:
                 log.debug("%s record lookup failed: %s", rtype, exc)
+                # Use the operating system resolver as a fallback. This is the
+                # approach used in v1.0.0 and works with environments whose
+                # system DNS configuration differs from dnspython's resolver.
+                if rtype == "A":
+                    info[key] = self._system_resolve(self.base_domain)
 
         with ThreadPoolExecutor(max_workers=self.config.max_threads) as pool:
             futures = [pool.submit(self._check_port, p) for p in self.config.common_ports]
@@ -322,6 +387,18 @@ class DomainScanner(ScannerCore):
         except OSError as exc:
             log.debug("port %s check failed: %s", port, exc)
             return port, False
+
+    @staticmethod
+    def _system_resolve(host):
+        """Resolve IPv4 addresses through the OS resolver as a fallback."""
+        try:
+            return sorted({
+                entry[4][0]
+                for entry in socket.getaddrinfo(host, None, socket.AF_INET)
+            })
+        except OSError as exc:
+            log.debug("system DNS lookup failed for %s: %s", host, exc)
+            return []
 
     def banner_grab(self, host, port):
         """Read a service banner; for HTTP ports send a HEAD probe."""
@@ -395,14 +472,18 @@ class DomainScanner(ScannerCore):
             host = f"{sub}.{self.base_domain}"
             try:
                 answers = dns.resolver.resolve(host, "A", lifetime=3)
+                ips = sorted({r.address for r in answers})
             except dns.exception.DNSException:
-                return
-            ips = sorted({r.address for r in answers})
+                # v1.0.0 used gethostbyname, which respects the host's normal
+                # resolver configuration. Keep that as a compatibility path.
+                ips = self._system_resolve(host)
+                if not ips:
+                    return
 
             for scheme in ("https", "http"):
                 url = f"{scheme}://{host}"
                 try:
-                    resp = self._request("GET", url, stream=True)
+                    resp = self._request("GET", url, stream=True, timeout=(4, 6))
                     status = resp.status_code
                     resp.close()
                     found[url] = {"status": status, "ips": ips}
@@ -460,6 +541,7 @@ class VulnerabilityScanner(ScannerCore):
         results["security_txt"] = self._check_security_txt()
         results["vulnerabilities"].extend(self._check_cookies(resp))
         results["vulnerabilities"].extend(self._check_html_comments(soup))
+        results["vulnerabilities"].extend(self._check_html_security(soup))
 
         if not self.config.passive:
             results["vulnerabilities"].extend(self._check_cors())
@@ -548,6 +630,45 @@ class VulnerabilityScanner(ScannerCore):
                     "severity": "low",
                     "remediation": REMEDIATION["Missing Security Header"],
                 })
+
+        csp = resp.headers.get("Content-Security-Policy", "")
+        if csp:
+            directives = {}
+            for part in csp.split(";"):
+                tokens = part.strip().split()
+                if tokens:
+                    directives[tokens[0].lower()] = [x.lower() for x in tokens[1:]]
+            weak = []
+            for name in ("default-src", "script-src", "style-src", "object-src"):
+                values = directives.get(name, [])
+                if "*" in values:
+                    weak.append(f"{name} allows all sources")
+                if name in ("script-src", "style-src"):
+                    if "'unsafe-inline'" in values:
+                        weak.append(f"{name} allows unsafe-inline")
+                    if name == "script-src" and "'unsafe-eval'" in values:
+                        weak.append("script-src allows unsafe-eval")
+            if "default-src" not in directives and "script-src" not in directives:
+                weak.append("no default-src or script-src directive")
+            if weak:
+                findings.append({
+                    "type": "Weak Content Security Policy",
+                    "issues": weak,
+                    "severity": "medium",
+                    "remediation": REMEDIATION["Weak Content Security Policy"],
+                })
+
+        hsts = resp.headers.get("Strict-Transport-Security", "")
+        if hsts:
+            max_age = re.search(r"(?:^|;)\s*max-age\s*=\s*(\d+)", hsts, re.I)
+            if not max_age or int(max_age.group(1)) < 31_536_000:
+                findings.append({
+                    "type": "Weak HSTS Configuration",
+                    "issue": "HSTS max-age is missing or shorter than one year",
+                    "header": hsts,
+                    "severity": "low",
+                    "remediation": REMEDIATION["Weak HSTS Configuration"],
+                })
         return findings
 
     def _check_security_txt(self):
@@ -586,7 +707,82 @@ class VulnerabilityScanner(ScannerCore):
                     "cookie": cookie.name, "severity": "low",
                     "remediation": REMEDIATION["Cookie Security"],
                 })
+            elif (str(cookie.get_nonstandard_attr("SameSite", "")).lower() == "none"
+                  and not cookie.secure):
+                issues.append({
+                    "type": "Cookie Security",
+                    "issue": "SameSite=None cookie is missing the Secure flag",
+                    "cookie": cookie.name, "severity": "medium",
+                    "remediation": REMEDIATION["Cookie Security"],
+                })
         return issues
+
+    def _check_html_security(self, soup):
+        """Check page markup for mixed content and unsafe form/link patterns."""
+        findings = []
+        if urlparse(self.target).scheme == "https":
+            insecure_resources = set()
+            for tag in soup.find_all(["script", "link", "img", "iframe", "audio",
+                                      "video", "source", "embed", "object"]):
+                resource = tag.get("src") or tag.get("href") or tag.get("data")
+                if resource:
+                    absolute = urljoin(self.target, resource)
+                    if urlparse(absolute).scheme == "http":
+                        insecure_resources.add(absolute)
+            if insecure_resources:
+                findings.append({
+                    "type": "Mixed Content",
+                    "count": len(insecure_resources),
+                    "examples": sorted(insecure_resources)[:5],
+                    "severity": "medium",
+                    "remediation": REMEDIATION["Mixed Content"],
+                })
+
+        insecure_password_forms = []
+        get_password_forms = []
+        for form in soup.find_all("form"):
+            password_fields = form.find_all("input", attrs={"type": re.compile("^password$", re.I)})
+            if not password_fields:
+                continue
+            action = urljoin(self.target, form.get("action") or "")
+            method = (form.get("method") or "get").lower()
+            if urlparse(action).scheme != "https":
+                insecure_password_forms.append(action)
+            elif method == "get":
+                get_password_forms.append(action)
+        if insecure_password_forms:
+            findings.append({
+                "type": "Insecure Form",
+                "issue": "Password form submits over HTTP",
+                "examples": sorted(set(insecure_password_forms))[:5],
+                "severity": "high",
+                "remediation": REMEDIATION["Insecure Form"],
+            })
+        if get_password_forms:
+            findings.append({
+                "type": "Insecure Form",
+                "issue": "Password form uses GET and may place credentials in the URL",
+                "examples": sorted(set(get_password_forms))[:5],
+                "severity": "medium",
+                "remediation": REMEDIATION["Insecure Form"],
+            })
+
+        unsafe_links = set()
+        for anchor in soup.find_all("a", href=True, target="_blank"):
+            destination = urljoin(self.target, anchor["href"])
+            if not self.in_scope(destination):
+                rel = {item.lower() for item in (anchor.get("rel") or [])}
+                if not ({"noopener", "noreferrer"} & rel):
+                    unsafe_links.add(destination)
+        if unsafe_links:
+            findings.append({
+                "type": "Unsafe External Link",
+                "count": len(unsafe_links),
+                "examples": sorted(unsafe_links)[:5],
+                "severity": "low",
+                "remediation": REMEDIATION["Unsafe External Link"],
+            })
+        return findings
 
     def _check_html_comments(self, soup):
         findings = []
@@ -787,28 +983,32 @@ class ReportGenerator:
     @staticmethod
     def print_summary(results):
         info = results["domain_info"]
-        print("\n[=== SCAN SUMMARY ===]")
-        print(f"Target: {results['target']}")
-        print(f"Scan completed in {results['scan_duration']:.2f} seconds")
-        print("\nDomain Information:")
-        print("  IPs:           " + (", ".join(info.get("ip")) or "none"))
-        print("  Nameservers:   " + (", ".join(info.get("nameservers")) or "none"))
-        print("  Open ports:    " + (", ".join(map(str, info.get("ports"))) or "none"))
+        console_print("\n[=== SCAN SUMMARY ===]", color=BLUE)
+        console_print(f"Target: {results['target']}", color=BLUE)
+        console_print(f"Scan completed in {results['scan_duration']:.2f} seconds",
+                      color=BLUE)
+        console_print("\nDomain Information:", color=BLUE)
+        console_print("  IPs:           " + (", ".join(info.get("ip")) or "none"),
+                      color=BLUE)
+        console_print("  Nameservers:   " + (", ".join(info.get("nameservers")) or "none"),
+                      color=BLUE)
+        console_print("  Open ports:    " + (", ".join(map(str, info.get("ports"))) or "none"),
+                      color=BLUE)
         for port, banner in info.get("banners", {}).items():
-            print(f"  Banner {port}:    {banner}")
+            console_print(f"  Banner {port}:    {banner}", color=BLUE)
         tls = info.get("tls")
         if tls:
             exp = tls.get("days_until_expiry")
-            print(f"  TLS cert:      expires in {exp} days" if exp is not None
-                  else "  TLS cert:      present")
+            console_print(f"  TLS cert:      expires in {exp} days" if exp is not None
+                          else "  TLS cert:      present", color=BLUE)
         waf = results.get("technologies", {}).get("waf_cdn", [])
         if waf:
-            print("  WAF/CDN:       " + ", ".join(waf))
+            console_print("  WAF/CDN:       " + ", ".join(waf), color=BLUE)
         if results.get("security_txt", {}).get("present"):
-            print("  security.txt:  present")
-        print(f"\nSubdomains found:    {len(results['subdomains'])}")
-        print(f"Endpoints collected: {len(results['endpoints'])}")
-        print(f"Findings:            {len(results['vulnerabilities'])}")
+            console_print("  security.txt:  present", color=BLUE)
+        console_print(f"\nSubdomains found:    {len(results['subdomains'])}", color=BLUE)
+        console_print(f"Endpoints collected: {len(results['endpoints'])}", color=BLUE)
+        console_print(f"Findings:            {len(results['vulnerabilities'])}", color=RED)
 
 
 # ---------------------------------------------------------------------------
@@ -847,12 +1047,39 @@ class WebScanPro:
                 domain_scanner.base_domain, cookies, headers,
             )
             self.results.update(vuln_scanner.scan_website())
+            self.results["vulnerabilities"].extend(
+                self._check_tls_certificate(self.results["domain_info"].get("tls"))
+            )
             self.results["scan_duration"] = time.time() - start
             self.results["passive"] = self.config.passive
             return True
         except Exception as exc:
             log.error("critical scan error: %s", exc)
             return False
+
+    @staticmethod
+    def _check_tls_certificate(tls_info):
+        findings = []
+        if not tls_info:
+            return findings
+        days_left = tls_info.get("days_until_expiry")
+        if days_left is not None and days_left <= 30:
+            findings.append({
+                "type": "TLS Certificate",
+                "issue": "Certificate is expired" if days_left <= 0
+                         else "Certificate expires within 30 days",
+                "days_until_expiry": days_left,
+                "severity": "high" if days_left <= 0 else "medium",
+                "remediation": REMEDIATION["TLS Certificate"],
+            })
+        if tls_info.get("certificate_trusted") is False:
+            findings.append({
+                "type": "TLS Certificate",
+                "issue": "Certificate validation failed",
+                "severity": "high",
+                "remediation": REMEDIATION["TLS Certificate"],
+            })
+        return findings
 
 
 def build_parser():
@@ -865,14 +1092,16 @@ def build_parser():
 
 
 def main(argv=None):
-    print(r"""
-        _     ___ ___  _    ___
-       | |   | _ \ _ \/_\ / __|
-       | |__ |  _/  _/ _ \__      
-       |____||_| |_| \___/|___/
+    console_print(r"""
+        ██╗     ██╗██████╗  █████╗ ███████╗
+        ██║     ██║██╔══██╗██╔══██╗██╔════╝
+        ██║     ██║██████╔╝███████║███████╗
+        ██║     ██║██╔═══╝ ██╔══██║╚════██║
+        ███████╗██║██║  ██║██║  ██║███████║
+        ╚══════╝╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
     """)
-    print("LIPAS - Lightweight Penetration Assessment Suite")
-    print(f"Version {VERSION}\n")
+    console_print("LIPAS - Lightweight Penetration Assessment Suite")
+    console_print(f"Version {VERSION}\n")
 
     parser = build_parser()
     parser.add_argument("-u", "--url", required=True, help="Target URL")
@@ -893,9 +1122,11 @@ def main(argv=None):
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
+    handler = logging.StreamHandler()
+    handler.setFormatter(GreenFormatter("[%(levelname)s] %(message)s"))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="[%(levelname)s] %(message)s",
+        handlers=[handler],
     )
 
     if args.insecure:
@@ -919,7 +1150,7 @@ def main(argv=None):
 
     scanner = WebScanPro(config)
     if not scanner.run_scan(args.url, cookies, headers, wordlist):
-        print("\n[!] Scan failed to complete")
+        console_print("\n[!] Scan failed to complete")
         sys.exit(1)
 
     ReportGenerator.print_summary(scanner.results)
@@ -930,13 +1161,13 @@ def main(argv=None):
             fh.write(report + "\n")
         log.info("report written to %s", args.output)
     else:
-        print("\n[+] Full report:")
-        print(report)
+        console_print("\n[+] Full report:")
+        console_print(report)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[!] Scan interrupted by user")
+        console_print("\n[!] Scan interrupted by user")
         sys.exit(1)
