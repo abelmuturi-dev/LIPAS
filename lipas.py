@@ -48,7 +48,7 @@ try:
 except ImportError:  # optional: falls back to simple suffix handling
     tldextract = None
 
-VERSION = "1.2.0"
+VERSION = "1.1.0"
 log = logging.getLogger("lipas")
 
 # Bundled public-suffix snapshot is used (no first-run network fetch).
